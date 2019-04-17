@@ -16,6 +16,14 @@ import (
 	"github.com/gopherjs/websocket/websocketjs"
 )
 
+const (
+	TextMessage   = 1
+	BinaryMessage = 2
+	CloseMessage  = 8
+	PingMessage   = 9
+	PongMessage   = 10
+)
+
 func beginHandlerOpen(ch chan error, removeHandlers func()) func(ev *js.Object) {
 	return func(ev *js.Object) {
 		removeHandlers()
@@ -106,8 +114,8 @@ func Dial(url string) (net.Conn, error) {
 	return conn, nil
 }
 
-// conn is a high-level wrapper around WebSocket. It implements net.Conn interface.
-type conn struct {
+// Conn is a high-level wrapper around WebSocket.
+type Conn struct {
 	*websocketjs.WebSocket
 
 	ch      chan *messageEvent
@@ -200,48 +208,21 @@ func getFrameData(obj *js.Object) []byte {
 	return []byte(obj.String())
 }
 
-func (c *conn) Read(b []byte) (n int, err error) {
-	if c.readBuf != nil {
-		n, err = c.readBuf.Read(b)
-		if err == io.EOF {
-			c.readBuf = nil
-			err = nil
-		}
-		// If we read nothing from the buffer, continue to trying to receive.
-		// This saves us when the last Read call emptied the buffer and this
-		// call triggers the EOF. There's probably a better way of doing this,
-		// but I'm really tired.
-		if n > 0 {
-			return
-		}
-	}
-
+func (c *conn) ReadMessage() (_ int, p []byte, err error) {
 	frame, err := c.receiveFrame(true)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	receivedBytes := getFrameData(frame.Data)
-
-	n = copy(b, receivedBytes)
-	// Fast path: The entire frame's contents have been copied into b.
-	if n >= len(receivedBytes) {
-		return
-	}
-
-	c.readBuf = bytes.NewReader(receivedBytes[n:])
-	return
+	return BinaryMessage, receivedBytes, nil
 }
 
-// Write writes the contents of b to the WebSocket using a binary opcode.
-func (c *conn) Write(b []byte) (n int, err error) {
+// WriteMessage writes the contents of p to the WebSocket using a binary opcode.
+func (c *conn) WriteMessage(_ int, p []byte) (err error) {
 	// []byte is converted to an Uint8Array by GopherJS, which fullfils the
 	// ArrayBufferView definition.
-	err = c.Send(b)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return c.Send(p)
 }
 
 // LocalAddr would typically return the local network address, but due to
