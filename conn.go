@@ -17,6 +17,14 @@ import (
 	"github.com/gopherjs/websocket/websocketjs"
 )
 
+const (
+	TextMessage   = 1
+	BinaryMessage = 2
+	CloseMessage  = 8
+	PingMessage   = 9
+	PongMessage   = 10
+)
+
 func beginHandlerOpen(ch chan error, removeHandlers func()) func(ev js.Value) {
 	return func(ev js.Value) {
 		removeHandlers()
@@ -60,12 +68,12 @@ var errDeadlineReached = &deadlineErr{}
 
 // Dial opens a new WebSocket connection. It will block until the connection is
 // established or fails to connect.
-func Dial(url string) (net.Conn, error) {
+func Dial(url string) (*Conn, error) {
 	ws, err := websocketjs.New(url)
 	if err != nil {
 		return nil, err
 	}
-	conn := &conn{
+	conn := &Conn{
 		WebSocket: ws,
 	}
 	conn.isClosed = new(uint32)
@@ -105,8 +113,8 @@ func Dial(url string) (net.Conn, error) {
 	return conn, nil
 }
 
-// conn is a high-level wrapper around WebSocket. It implements net.Conn interface.
-type conn struct {
+// Conn is a high-level wrapper around WebSocket.
+type Conn struct {
 	*websocketjs.WebSocket
 
 	isClosed *uint32
@@ -126,11 +134,11 @@ type messageEvent struct {
 	// Data js.Value `js:"data"`
 }
 
-func (c *conn) onMessage(event js.Value) {
+func (c *Conn) onMessage(event js.Value) {
 	c.writeCh <- &messageEvent{Value: event}
 }
 
-func (c *conn) onClose(event js.Value) {
+func (c *Conn) onClose(event js.Value) {
 	// We queue nil to the end so that any messages received prior to
 	// closing get handled first.
 	swapped := atomic.CompareAndSwapUint32(c.isClosed, 0, 1)
@@ -143,16 +151,16 @@ func (c *conn) onClose(event js.Value) {
 	}
 }
 
-func (c *conn) Close() error {
+func (c *Conn) Close() error {
 	err := c.WebSocket.Close()
 	c.onClose(js.Null())
 	return err
 }
 
-// initialize adds all of the event handlers necessary for a conn to function.
+// initialize adds all of the event handlers necessary for a Conn to function.
 // It should never be called more than once and is already called if Dial was
-// used to create the conn.
-func (c *conn) initialize() {
+// used to create the Conn.
+func (c *Conn) initialize() {
 	writeChan := make(chan *messageEvent)
 	readChan := make(chan *messageEvent)
 
@@ -172,7 +180,7 @@ func (c *conn) initialize() {
 	c.AddEventListener("close", c.onCloseCallback)
 }
 
-func (c *conn) bufferMessageEvents(write chan *messageEvent, read chan *messageEvent) {
+func (c *Conn) bufferMessageEvents(write chan *messageEvent, read chan *messageEvent) {
 	queue := make([]*messageEvent, 0, 16)
 
 	getReadChan := func() chan *messageEvent {
@@ -209,7 +217,7 @@ func (c *conn) bufferMessageEvents(write chan *messageEvent, read chan *messageE
 
 // handleFrame handles a single frame received from the channel. This is a
 // convenience funciton to dedupe code for the multiple deadline cases.
-func (c *conn) handleFrame(message *messageEvent, ok bool) (*messageEvent, error) {
+func (c *Conn) handleFrame(message *messageEvent, ok bool) (*messageEvent, error) {
 	if !ok { // The channel has been closed
 		return nil, io.EOF
 	}
@@ -219,7 +227,7 @@ func (c *conn) handleFrame(message *messageEvent, ok bool) (*messageEvent, error
 
 // receiveFrame receives one full frame from the WebSocket. It blocks until the
 // frame is received.
-func (c *conn) receiveFrame(observeDeadline bool) (*messageEvent, error) {
+func (c *Conn) receiveFrame(observeDeadline bool) (*messageEvent, error) {
 	var deadlineChan <-chan time.Time // Receiving on a nil channel always blocks indefinitely
 
 	if observeDeadline && !c.readDeadline.IsZero() {
@@ -260,66 +268,39 @@ func getFrameData(obj js.Value) []byte {
 	return []byte(obj.String())
 }
 
-func (c *conn) Read(b []byte) (n int, err error) {
-	if c.readBuf != nil {
-		n, err = c.readBuf.Read(b)
-		if err == io.EOF {
-			c.readBuf = nil
-			err = nil
-		}
-		// If we read nothing from the buffer, continue to trying to receive.
-		// This saves us when the last Read call emptied the buffer and this
-		// call triggers the EOF. There's probably a better way of doing this,
-		// but I'm really tired.
-		if n > 0 {
-			return
-		}
-	}
-
+func (c *Conn) ReadMessage() (_ int, p []byte, err error) {
 	frame, err := c.receiveFrame(true)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	receivedBytes := getFrameData(frame.Get("data"))
-
-	n = copy(b, receivedBytes)
-	// Fast path: The entire frame's contents have been copied into b.
-	if n >= len(receivedBytes) {
-		return
-	}
-
-	c.readBuf = bytes.NewReader(receivedBytes[n:])
-	return
+	return BinaryMessage, receivedBytes, nil
 }
 
-// Write writes the contents of b to the WebSocket using a binary opcode.
-func (c *conn) Write(b []byte) (n int, err error) {
+// WriteMessage writes the contents of p to the WebSocket using a binary opcode.
+func (c *Conn) WriteMessage(_ int, p []byte) (err error) {
 	// []byte is converted to an Uint8Array by GopherJS, which fullfils the
 	// ArrayBufferView definition.
-	byteArray := js.TypedArrayOf(b)
+	byteArray := js.TypedArrayOf(p)
 	defer byteArray.Release()
-	err = c.Send(byteArray.Value)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return c.Send(byteArray.Value)
 }
 
 // LocalAddr would typically return the local network address, but due to
 // limitations in the JavaScript API, it is unable to. Calling this method will
 // cause a panic.
-func (c *conn) LocalAddr() net.Addr {
-	// BUG(nightexcessive): conn.LocalAddr() panics because the underlying
+func (c *Conn) LocalAddr() net.Addr {
+	// BUG(nightexcessive): Conn.LocalAddr() panics because the underlying
 	// JavaScript API has no way of figuring out the local address.
 
 	// TODO(nightexcessive): Find a more graceful way to handle this
-	panic("we are unable to implement websocket.conn.LocalAddr() due to limitations in the underlying JavaScript API")
+	panic("we are unable to implement websocket.Conn.LocalAddr() due to limitations in the underlying JavaScript API")
 }
 
 // RemoteAddr returns the remote network address, based on
 // websocket.WebSocket.URL.
-func (c *conn) RemoteAddr() net.Addr {
+func (c *Conn) RemoteAddr() net.Addr {
 	wsURL, err := url.Parse(c.Get("url").String())
 	if err != nil {
 		// TODO(nightexcessive): Should we be panicking for this?
@@ -332,20 +313,20 @@ func (c *conn) RemoteAddr() net.Addr {
 // It is equivalent to calling both SetReadDeadline and SetWriteDeadline.
 //
 // A zero value for t means that I/O operations will not time out.
-func (c *conn) SetDeadline(t time.Time) error {
+func (c *Conn) SetDeadline(t time.Time) error {
 	c.readDeadline = t
 	return nil
 }
 
 // SetReadDeadline sets the deadline for future Read calls. A zero value for t
 // means Read will not time out.
-func (c *conn) SetReadDeadline(t time.Time) error {
+func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.readDeadline = t
 	return nil
 }
 
 // SetWriteDeadline sets the deadline for future Write calls. Because our writes
 // do not block, this function is a no-op.
-func (c *conn) SetWriteDeadline(t time.Time) error {
+func (c *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
